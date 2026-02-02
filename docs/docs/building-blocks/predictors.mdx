@@ -1,5 +1,200 @@
 ---
 title: 'Predictors'
-description: 'Learn how to create and use predictors for LM inference'
+description: 'Orchestrate LM calls with signatures and adapters'
 icon: 'robot'
 ---
+
+Predictors are the simplest way to make LM calls in DSRs. They take a signature and input data, use an adapter to format the prompt, call the LM, and return a structured prediction.
+
+## What is a predictor?
+
+A predictor orchestrates the full LM call pipeline:
+
+```
+┌─────────┐     ┌───────────┐     ┌─────────┐     ┌────────┐
+│ Inputs  │ ──► │ Predictor │ ──► │ Adapter │ ──► │   LM   │
+│(Example)│     │           │     │         │     │        │
+└─────────┘     └───────────┘     └─────────┘     └────────┘
+                      │                                │
+                      │          ┌────────────┐        │
+                      └───────── │ Prediction │ ◄──────┘
+                                 └────────────┘
+```
+
+The `Predictor` trait defines the interface:
+
+```rust
+pub trait Predictor: Send + Sync {
+    async fn forward(&self, inputs: Example) -> Result<Prediction>;
+    async fn forward_with_config(&self, inputs: Example, lm: Arc<LM>) -> Result<Prediction>;
+}
+```
+
+## Predict: the basic predictor
+
+`Predict` is the standard predictor implementation. It wraps a signature and uses the globally configured LM and adapter.
+
+### Creating a predictor
+
+```rust
+use dsrs::{Predict, Signature};
+
+#[Signature]
+struct QA {
+    /// Answer questions concisely.
+
+    #[input]
+    question: String,
+
+    #[output]
+    answer: String,
+}
+
+let predictor = Predict::new(QA::new());
+```
+
+### Running predictions
+
+```rust
+use dsrs::{Example, Predictor, hashmap};
+
+let inputs = Example::new(
+    hashmap! {
+        "question".to_string() => "What is the capital of France?".into()
+    },
+    vec!["question".to_string()],
+    vec!["answer".to_string()],
+);
+
+let result = predictor.forward(inputs).await?;
+println!("Answer: {}", result.get("answer", None));
+```
+
+### Using a specific LM
+
+Override the global LM for a single call:
+
+```rust
+let custom_lm = LM::builder()
+    .config(LMConfig::builder().model("gpt-4".to_string()).build())
+    .api_key(api_key)
+    .build()
+    .await;
+
+let result = predictor.forward_with_config(inputs, Arc::new(custom_lm)).await?;
+```
+
+## Complete example
+
+```rust
+use dsrs::{
+    ChatAdapter, Example, LM, LMConfig, Predict, Predictor,
+    Signature, configure, hashmap,
+};
+use std::env;
+
+#[Signature]
+struct Summarizer {
+    /// Summarize the text in 2-3 sentences.
+
+    #[input(desc = "Text to summarize")]
+    text: String,
+
+    #[output(desc = "A brief summary")]
+    summary: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Configure global LM and adapter
+    let config = LMConfig::builder()
+        .model("gpt-4.1-nano".to_string())
+        .build();
+
+    let lm = LM::builder()
+        .config(config)
+        .api_key(env::var("OPENAI_API_KEY")?.into())
+        .build()
+        .await;
+
+    configure(lm, ChatAdapter::default());
+
+    // Create predictor
+    let predictor = Predict::new(Summarizer::new());
+
+    // Prepare input
+    let inputs = Example::new(
+        hashmap! {
+            "text".to_string() => "DSRs is a Rust framework for building
+            language model pipelines. It provides signatures for defining
+            task schemas, adapters for formatting prompts, and predictors
+            for orchestrating LM calls. The framework supports optimization
+            and few-shot learning.".into()
+        },
+        vec!["text".to_string()],
+        vec!["summary".to_string()],
+    );
+
+    // Run prediction
+    let result = predictor.forward(inputs).await?;
+    println!("Summary: {}", result.get("summary", None));
+
+    Ok(())
+}
+```
+
+## Optimizable predictors
+
+`Predict` implements the `Optimizable` trait, enabling optimization workflows:
+
+```rust
+impl Optimizable for Predict {
+    fn get_signature(&self) -> &dyn MetaSignature;
+    fn parameters(&mut self) -> IndexMap<String, &mut dyn Optimizable>;
+    fn update_signature_instruction(&mut self, instruction: String) -> Result<()>;
+}
+```
+
+This allows optimizers like GEPA or COPRO to tune the predictor's instruction based on evaluation results.
+
+## Working with Predictions
+
+The `Prediction` struct holds the LM's output:
+
+```rust
+pub struct Prediction {
+    pub data: HashMap<String, serde_json::Value>,
+    pub lm_usage: LmUsage,
+}
+```
+
+Access fields with `.get()`:
+
+```rust
+// Get a field value with optional default
+let answer = result.get("answer", Some("No answer"));
+
+// Get all field names
+let keys = result.keys();
+
+// Access usage stats
+println!("Tokens used: {:?}", result.lm_usage);
+```
+
+## Predictors vs Modules
+
+| Aspect | Predictor | Module |
+|--------|-----------|--------|
+| Purpose | Single LM call | Compose multiple calls |
+| Interface | `forward(inputs)` | `forward(inputs)` |
+| Flexibility | Fixed signature | Custom logic |
+| Use case | Simple tasks | Complex pipelines |
+
+Predictors are building blocks. For complex pipelines with multiple LM calls or custom logic, wrap predictors in a [Module](/docs/building-blocks/module).
+
+## Next steps
+
+- Define task schemas with [Signatures](/docs/building-blocks/signature)
+- Understand prompt formatting with [Adapters](/docs/building-blocks/adapter)
+- Build complex pipelines with [Modules](/docs/building-blocks/module)
+- Optimize predictors with [GEPA](/docs/optimizers/gepa) or [COPRO](/docs/optimizers/copro)

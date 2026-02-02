@@ -4,7 +4,7 @@ description: 'Define task specifications for LM interactions'
 icon: 'pen-to-square'
 ---
 
-Signatures declare the schema of your LM task: the inputs you provide and the outputs you expect. In Rust terms, a `#[Signature]` macro generates an implementation of the `MetaSignature` trait for your type.
+Signatures declare the schema of your LM task: the inputs you provide and the outputs you expect. If you're familiar with DSPy, signatures in DSRs work similarly—they define a task contract that adapters use to format prompts and parse responses.
 
 ## What is a signature?
 
@@ -12,14 +12,17 @@ Signatures declare the schema of your LM task: the inputs you provide and the ou
 - **Rust shape:** A normal Rust `struct` annotated with `#[Signature]` and field attributes (`#[input]`, `#[output]`).
 - **Trait impl:** The macro implements `MetaSignature` (introspection of input/output fields, instruction, demos).
 
-## Defining a signature
+Think of a signature as a typed interface between your code and the LM. You declare what goes in and what comes out, and the adapter handles the rest.
+
+## Basic syntax
 
 ```rust
 use dsrs::Signature;
 
 #[Signature]
 struct QA {
-    /// Use Renaissance-era English to answer the question.
+    /// Answer questions using clear, concise language.
+
     #[input]
     question: String,
 
@@ -28,19 +31,163 @@ struct QA {
 }
 ```
 
-- **Doc comments:** The `///` above the struct become the signature’s instruction (used by adapters).
-- **Field roles:** Mark inputs vs. outputs with attributes for clear orchestration.
+### Key points
+
+1. **Doc comments become instructions**: The `///` doc comment above the first `#[input]` field becomes the signature's instruction. This tells the LM how to approach the task.
+
+2. **Field roles**: Every field must have either `#[input]` or `#[output]`. A field cannot be both.
+
+3. **Field descriptions**: Add descriptions with `#[input(desc = "...")]` or `#[output(desc = "...")]`:
+
+```rust
+#[Signature]
+struct QA {
+    /// Answer the question concisely but accurately.
+
+    #[input(desc = "The user's question")]
+    question: String,
+
+    #[output(desc = "A direct answer in under 50 words")]
+    answer: String,
+}
+```
+
+## What the macro generates
+
+The `#[Signature]` macro transforms your struct into a new struct with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `instruction` | `String` | The task instruction (from doc comments) |
+| `input_fields` | `serde_json::Value` | JSON schema of input fields |
+| `output_fields` | `serde_json::Value` | JSON schema of output fields |
+| `demos` | `Vec<Example>` | Few-shot examples (initially empty) |
+
+It also implements the `MetaSignature` trait, giving you methods like:
+
+```rust
+let sig = QA::new();
+
+sig.instruction()      // Get the instruction string
+sig.input_fields()     // Get input field schemas as JSON
+sig.output_fields()    // Get output field schemas as JSON
+sig.demos()            // Get attached few-shot examples
+```
+
+## Built-in signature options
+
+The `#[Signature]` macro supports optional arguments for common patterns:
+
+### Chain-of-thought (`cot`)
+
+Adds a `reasoning` output field that encourages the LM to think step-by-step before answering:
+
+```rust
+#[Signature(cot)]
+struct QA {
+    #[input]
+    question: String,
+
+    #[output]
+    answer: String,
+    // `reasoning` output field is automatically added
+}
+```
+
+The `reasoning` field has the description "Think step by step" and appears before your declared output fields.
+
+### Hint field (`hint`)
+
+Adds a `hint` input field for passing additional guidance at runtime:
+
+```rust
+#[Signature(hint)]
+struct QA {
+    #[input]
+    question: String,
+
+    #[output]
+    answer: String,
+    // `hint` input field is automatically added
+}
+```
+
+### Combining options
+
+You can use both:
+
+```rust
+#[Signature(cot, hint)]
+struct QA {
+    #[input]
+    question: String,
+
+    #[output]
+    answer: String,
+}
+```
+
+## Complex types
+
+Signatures support complex types beyond `String`. For non-primitive types, the macro automatically generates JSON schemas using `schemars`:
+
+```rust
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct ExtractedInfo {
+    name: String,
+    age: u32,
+    email: Option<String>,
+}
+
+#[Signature]
+struct InfoExtractor {
+    #[input]
+    document: String,
+
+    #[output]
+    info: ExtractedInfo,  // JSON schema is auto-generated
+}
+```
+
+The adapter will include the JSON schema in the prompt and parse the LM's response back into your type.
+
+### Supported primitive types
+
+These types don't generate schemas (treated as simple values):
+- `String`, `str`, `char`
+- `bool`
+- `i8`, `i16`, `i32`, `i64`, `i128`, `isize`
+- `u8`, `u16`, `u32`, `u64`, `u128`, `usize`
+- `f32`, `f64`
 
 ## Inline macro alternative
 
+For quick, one-off signatures, use the `sign!` macro:
+
 ```rust
 use dsrs::sign;
-let sig = sign! { (question: String) -> answer: String };
+
+let sig = sign! {
+    (question: String) -> answer: String
+};
 ```
+
+Multiple fields:
+
+```rust
+let sig = sign! {
+    (question: String, context: String) -> answer: String, confidence: f32
+};
+```
+
+This is useful for prototyping, but struct-based signatures are better for reuse and adding instructions.
 
 ## Demos (few-shot examples)
 
-You can attach examples at runtime for few-shot prompting.
+Attach examples at runtime for few-shot prompting:
 
 ```rust
 use dsrs::{Example, MetaSignature, hashmap};
@@ -49,16 +196,131 @@ let mut sig = QA::new();
 sig.set_demos(vec![
     Example::new(
         hashmap!{
-            "question".to_string() => "What is gravity?".into(),
-            "answer".to_string() => "A natural power that draweth bodies earthward.".into()
+            "question".to_string() => "What is the capital of France?".into(),
+            "answer".to_string() => "Paris".into()
         },
-        vec!["question".to_string()],
-        vec!["answer".to_string()],
+        vec!["question".to_string()],  // input field names
+        vec!["answer".to_string()],    // output field names
     )
 ])?;
 ```
 
-## Where it fits
+Or use the `example!` macro for cleaner syntax:
 
-- A `Signature` does not call the LM by itself; a `Predictor` uses it, via an `Adapter`, to build a `Chat` and parse a `Prediction`.
-- Keeping the task contract as data (the signature) supports reuse, testing, and optimizer integration later.
+```rust
+use dsrs::example;
+
+let demo = example! {
+    "question": "input" => "What is the capital of France?",
+    "answer": "output" => "Paris"
+};
+```
+
+## Dynamic field manipulation
+
+Signatures can be modified at runtime:
+
+```rust
+use dsrs::{field, MetaSignature};
+use serde_json::json;
+
+let mut sig = QA::new();
+
+// Update the instruction
+sig.update_instruction("Answer in haiku format.".to_string())?;
+
+// Append a new field
+sig.append("confidence", json!({
+    "type": "f32",
+    "desc": "Confidence score from 0 to 1",
+    "schema": "",
+    "__dsrs_field_type": "output"
+}))?;
+```
+
+## Where signatures fit
+
+```
+┌─────────────┐
+│  Signature  │  ← Defines task schema (inputs, outputs, instruction)
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│  Predictor  │  ← Orchestrates the LM call
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│   Adapter   │  ← Formats prompt, parses response
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│     LM      │  ← Executes the call
+└─────────────┘
+```
+
+- A **Signature** does not call the LM by itself
+- A **Predictor** uses the signature, via an **Adapter**, to build a prompt and parse the response
+- Keeping the task contract as data supports reuse, testing, and optimizer integration
+
+## Complete example
+
+```rust
+use dsrs::{
+    ChatAdapter, Example, LM, LMConfig, Predict, Predictor,
+    Signature, configure, hashmap,
+};
+use std::env;
+
+#[Signature(cot)]
+struct MathSolver {
+    /// Solve math problems step by step. Show your work.
+
+    #[input(desc = "A math problem to solve")]
+    problem: String,
+
+    #[output(desc = "The final numerical answer")]
+    answer: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = LMConfig::builder()
+        .model("gpt-4.1-nano".to_string())
+        .build();
+
+    let lm = LM::builder()
+        .config(config)
+        .api_key(env::var("OPENAI_API_KEY")?.into())
+        .build()
+        .await;
+
+    configure(lm, ChatAdapter::default());
+
+    let sig = MathSolver::new();
+    let predictor = Predict::new(sig);
+
+    let inputs = Example::new(
+        hashmap! {
+            "problem".to_string() => "What is 15% of 80?".into()
+        },
+        vec!["problem".to_string()],
+        vec!["reasoning".to_string(), "answer".to_string()],
+    );
+
+    let result = predictor.forward(inputs).await?;
+
+    println!("Reasoning: {}", result.get("reasoning", None));
+    println!("Answer: {}", result.get("answer", None));
+
+    Ok(())
+}
+```
+
+## Next steps
+
+- Learn about [Predictors](/docs/building-blocks/predictors) to see how signatures are used
+- Understand the [ChatAdapter](/docs/building-blocks/adapter) to see how prompts are formatted
+- Build [Modules](/docs/building-blocks/module) that compose multiple predictors

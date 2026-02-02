@@ -1,5 +1,174 @@
 ---
 title: 'Adapter'
-description: 'Wrapper that sits on top of LM and Signature for data orchestration.'
-icon: 
+description: 'Format prompts and parse responses between signatures and LMs'
+icon: 'arrows-turn-to-dots'
 ---
+
+Adapters sit between signatures and language models. They transform your structured signature into a prompt the LM can follow, and parse the LM's response back into structured data.
+
+## What is an adapter?
+
+An adapter handles two jobs:
+
+1. **Format**: Convert a signature + inputs into a `Chat` (list of messages)
+2. **Parse**: Extract structured output fields from the LM's response
+
+## The Adapter trait
+
+```rust
+#[async_trait]
+pub trait Adapter: Send + Sync + 'static {
+    fn format(&self, signature: &dyn MetaSignature, inputs: Example) -> Chat;
+
+    fn parse_response(
+        &self,
+        signature: &dyn MetaSignature,
+        response: Message,
+    ) -> HashMap<String, Value>;
+
+    async fn call(
+        &self,
+        lm: Arc<LM>,
+        signature: &dyn MetaSignature,
+        inputs: Example,
+    ) -> Result<Prediction>;
+}
+```
+
+## ChatAdapter
+
+`ChatAdapter` is the default adapter in DSRs. It uses a structured prompt format with field markers.
+
+### Basic usage
+
+```rust
+use dsrs::{ChatAdapter, configure, LM};
+
+configure(lm, ChatAdapter::default());
+```
+
+### Prompt structure
+
+ChatAdapter creates a system message with three parts:
+
+**1. Field descriptions** - Lists input/output fields with types:
+```
+Your input fields are:
+1. `question` (String): The user's question
+
+Your output fields are:
+1. `answer` (String): A direct answer
+```
+
+**2. Field structure** - Shows the format using `[[ ## field ## ]]` markers:
+```
+[[ ## question ## ]]
+question
+
+[[ ## answer ## ]]
+answer
+
+[[ ## completed ## ]]
+```
+
+**3. Task description** - The instruction from your signature:
+```
+In adhering to this structure, your objective is:
+    Answer questions using clear, concise language.
+```
+
+### User messages
+
+Input values are formatted with field markers:
+
+```
+[[ ## question ## ]]
+What is the capital of France?
+
+Respond with the corresponding output fields, starting with the field `answer`, and then ending with the marker for `completed`.
+```
+
+### Response parsing
+
+ChatAdapter extracts values by finding text between field markers:
+
+```
+[[ ## answer ## ]]
+Paris is the capital of France.
+
+[[ ## completed ## ]]
+```
+
+This becomes `{"answer": "Paris is the capital of France."}`.
+
+### Type handling
+
+- **String fields**: Values taken as-is, no schema in prompt
+- **Complex types**: JSON schema included in prompt, response parsed as JSON
+
+For complex types, the prompt includes:
+```
+# note: the value you produce must adhere to the JSON schema: {...}
+```
+
+## Few-shot demos
+
+When a signature has demos, ChatAdapter formats them as user/assistant message pairs before the actual query. This teaches the LM the expected format through examples.
+
+## Caching
+
+ChatAdapter integrates with the LM's cache:
+
+1. Before calling the LM, checks if this exact input has been cached
+2. After a successful call, stores the result for future use
+3. Caching is controlled by `LMConfig.cache`
+
+## Implementing custom adapters
+
+You can implement the `Adapter` trait to create custom prompt formats:
+
+```rust
+use dsrs::{Adapter, Chat, Example, LM, Message, MetaSignature, Prediction};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+struct MyAdapter;
+
+#[async_trait::async_trait]
+impl Adapter for MyAdapter {
+    fn format(&self, signature: &dyn MetaSignature, inputs: Example) -> Chat {
+        // Custom prompt formatting logic
+        let mut chat = Chat::new(vec![]);
+        chat.push("system", &signature.instruction());
+        // ... add your formatting
+        chat
+    }
+
+    fn parse_response(
+        &self,
+        signature: &dyn MetaSignature,
+        response: Message,
+    ) -> HashMap<String, serde_json::Value> {
+        // Custom parsing logic
+        HashMap::new()
+    }
+
+    async fn call(
+        &self,
+        lm: Arc<LM>,
+        signature: &dyn MetaSignature,
+        inputs: Example,
+    ) -> anyhow::Result<Prediction> {
+        let messages = self.format(signature, inputs);
+        let response = lm.call(messages).await?;
+        let output = self.parse_response(signature, response.output);
+        Ok(Prediction::new(output, response.usage))
+    }
+}
+```
+
+## Next steps
+
+- Learn about [Signatures](/docs/building-blocks/signature) to define your task schema
+- See [Predictors](/docs/building-blocks/predictors) for how adapters are used in practice
+- Check [LM](/docs/building-blocks/lm) for configuring your language model
