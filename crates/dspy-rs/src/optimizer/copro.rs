@@ -88,6 +88,21 @@ impl Optimizer for COPRO {
         module: &mut M,
         trainset: Vec<Example>,
     ) -> Result<()> {
+        let span = tracing::info_span!(
+            "copro.compile",
+            breadth = self.breadth,
+            depth = self.depth,
+            trainset_size = trainset.len(),
+        );
+        let _enter = span.enter();
+
+        tracing::info!(
+            breadth = self.breadth,
+            depth = self.depth,
+            trainset_size = trainset.len(),
+            "starting COPRO optimization"
+        );
+
         if self.breadth <= 1 {
             return Err(anyhow::anyhow!("Breadth must be greater than 1"));
         }
@@ -191,6 +206,7 @@ impl Optimizer for COPRO {
 
         // Main optimization loop
         for d in 0..self.depth {
+            tracing::info!(depth = d + 1, max_depth = self.depth, "starting optimization iteration");
             println!("Iteration Depth: {}/{}", d + 1, self.depth);
 
             // Evaluate candidates for each predictor
@@ -241,6 +257,13 @@ impl Optimizer for COPRO {
                         let score = module.evaluate(trainset.clone()).await;
                         stats.total_calls += 1;
 
+                        tracing::debug!(
+                            predictor = predictor_name,
+                            candidate = c_i + 1,
+                            score = score,
+                            "evaluated candidate"
+                        );
+
                         // Store evaluated candidate
                         evaluated_candidates
                             .get_mut(predictor_name)
@@ -275,6 +298,11 @@ impl Optimizer for COPRO {
                         }
                     }
 
+                    tracing::info!(
+                        predictor = predictor_name,
+                        score = best.score,
+                        "updated predictor to best candidate"
+                    );
                     println!(
                         "Updating Predictor {} to best candidate with score {:.3}",
                         predictor_name, best.score
@@ -455,6 +483,13 @@ impl Optimizer for COPRO {
         }
 
         // Update original module with best candidates
+        if let Some((_, ref best_candidate)) = best_overall {
+            tracing::info!(
+                best_score = best_candidate.score,
+                total_calls = stats.total_calls,
+                "COPRO optimization complete"
+            );
+        }
         if let Some((_, best_candidate)) = best_overall {
             let module_predictors = module.parameters();
             for (predictor_name, predictor) in module_predictors {

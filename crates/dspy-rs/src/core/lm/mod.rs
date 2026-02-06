@@ -84,21 +84,36 @@ impl LM {
     /// 3. Provider via model string: no `base_url`, model in "provider:model" format
     ///    → Uses provider-specific client (openai, anthropic, gemini, etc.)
     async fn initialize_client(mut self) -> Result<Self> {
+        let span = tracing::info_span!(
+            "lm.init",
+            model = %self.model,
+            cache = self.cache,
+        );
+        let _enter = span.enter();
+
         // Determine which build case based on what's provided
         let client = match (&self.base_url, &self.api_key, &self.model) {
             // Case 1: OpenAI-compatible with authentication (base_url + api_key)
             // For custom OpenAI-compatible APIs that require API keys
-            (Some(base_url), Some(api_key), _) => Arc::new(LMClient::from_openai_compatible(
-                base_url,
-                api_key,
-                &self.model,
-            )?),
+            (Some(base_url), Some(api_key), _) => {
+                tracing::info!(model = %self.model, base_url = %base_url, "initializing OpenAI-compatible client with auth");
+                Arc::new(LMClient::from_openai_compatible(
+                    base_url,
+                    api_key,
+                    &self.model,
+                )?)
+            }
             // Case 2: Local OpenAI-compatible server (base_url only, no api_key)
             // For vLLM, text-generation-inference, and other local OpenAI-compatible servers
-            (Some(base_url), None, _) => Arc::new(LMClient::from_local(base_url, &self.model)?),
+            (Some(base_url), None, _) => {
+                tracing::info!(model = %self.model, base_url = %base_url, "initializing local OpenAI-compatible client");
+                Arc::new(LMClient::from_local(base_url, &self.model)?)
+            }
             // Case 3: Provider via model string (no base_url, model in "provider:model" format)
             // Uses provider-specific clients
             (None, api_key, model) if model.contains(':') => {
+                let provider = model.split_once(':').map(|(p, _)| p).unwrap_or("unknown");
+                tracing::info!(model = %model, provider = provider, "initializing provider client");
                 Arc::new(LMClient::from_model_string(model, api_key.as_deref())?)
             }
             // Default case: assume OpenAI provider if no colon in model name
@@ -108,6 +123,7 @@ impl LM {
                 } else {
                     format!("openai:{}", model)
                 };
+                tracing::info!(model = %model_str, provider = "openai", "initializing provider client (default)");
                 Arc::new(LMClient::from_model_string(&model_str, api_key.as_deref())?)
             }
         };
@@ -116,6 +132,7 @@ impl LM {
 
         // Initialize cache if enabled
         if self.cache && self.cache_handler.is_none() {
+            tracing::debug!(model = %self.model, "initializing response cache");
             self.cache_handler = Some(Arc::new(Mutex::new(ResponseCache::new().await)));
         }
 
@@ -168,12 +185,20 @@ impl LM {
 
         let max_iterations = self.max_tool_iterations as usize;
 
+        let span = tracing::debug_span!(
+            "tool_loop",
+            model = %self.model,
+            max_iterations = max_iterations,
+        );
+        let _enter = span.enter();
+
         let mut tool_calls = Vec::new();
         let mut tool_executions = Vec::new();
 
         // Execute the first tool call
         let tool_name = &initial_tool_call.function.name;
         let args_str = initial_tool_call.function.arguments.to_string();
+        tracing::debug!(tool = %tool_name, "executing initial tool call");
 
         let mut tool_result = format!("Tool '{}' not found", tool_name);
         for tool in &mut tools {
@@ -309,6 +334,15 @@ impl LM {
         use rig::OneOrMany;
         use rig::completion::CompletionRequest;
 
+        let span = tracing::info_span!(
+            "lm.call",
+            model = %self.model,
+            temperature = self.temperature,
+            max_tokens = self.max_tokens,
+            tools = tools.len(),
+        );
+        let _enter = span.enter();
+
         let request_messages = messages.get_rig_messages();
 
         let mut tool_definitions = Vec::new();
@@ -319,6 +353,12 @@ impl LM {
         // Build the completion request manually
         let mut chat_history = request_messages.conversation;
         chat_history.push(request_messages.prompt);
+
+        tracing::debug!(
+            model = %self.model,
+            messages = chat_history.len(),
+            "sending completion request"
+        );
 
         let request = CompletionRequest {
             preamble: Some(request_messages.system.clone()),
@@ -347,9 +387,20 @@ impl LM {
                 anyhow::anyhow!("LM client not initialized. Call build() on LMBuilder.")
             })?
             .completion(request)
-            .await?;
+            .await
+            .map_err(|err| {
+                tracing::error!(model = %self.model, error = %err, "completion request failed");
+                err
+            })?;
 
         let mut accumulated_usage = LmUsage::from(response.usage);
+
+        tracing::debug!(
+            model = %self.model,
+            prompt_tokens = accumulated_usage.prompt_tokens,
+            completion_tokens = accumulated_usage.completion_tokens,
+            "completion response received"
+        );
 
         // Handle the response
         let mut tool_loop_result = None;
@@ -359,6 +410,10 @@ impl LM {
                 Message::assistant(reasoning.reasoning.join("\n"))
             }
             AssistantContent::ToolCall(tool_call) if !tools.is_empty() => {
+                tracing::debug!(
+                    tool = %tool_call.function.name,
+                    "LM requested tool call, entering tool loop"
+                );
                 // Only execute tool loop if we have tools available
                 let result = self
                     .execute_tool_loop(
@@ -376,6 +431,10 @@ impl LM {
                 message
             }
             AssistantContent::ToolCall(tool_call) => {
+                tracing::warn!(
+                    tool = %tool_call.function.name,
+                    "LM requested tool call but no tools available"
+                );
                 // No tools available, just return a message indicating this
                 let msg = format!(
                     "Tool call requested: {} with args: {}, but no tools available",
@@ -385,6 +444,20 @@ impl LM {
             }
             AssistantContent::Image(_image) => todo!(),
         };
+
+        let tool_call_count = tool_loop_result
+            .as_ref()
+            .map(|r| r.tool_calls.len())
+            .unwrap_or(0);
+
+        tracing::info!(
+            model = %self.model,
+            prompt_tokens = accumulated_usage.prompt_tokens,
+            completion_tokens = accumulated_usage.completion_tokens,
+            total_tokens = accumulated_usage.total_tokens,
+            tool_calls = tool_call_count,
+            "LM call completed"
+        );
 
         let mut full_chat = messages.clone();
         full_chat.push_message(first_choice.clone());

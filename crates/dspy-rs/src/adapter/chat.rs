@@ -581,6 +581,7 @@ impl ChatAdapter {
             let raw_text = match sections.get(field.name) {
                 Some(text) => text.clone(),
                 None => {
+                    tracing::debug!(field = rust_name, "missing field in response");
                     errors.push(ParseError::MissingField {
                         field: rust_name.clone(),
                         raw_response: content.to_string(),
@@ -593,6 +594,11 @@ impl ChatAdapter {
                 match jsonish::from_str(output_format, &type_ir, &raw_text, true) {
                     Ok(value) => value,
                     Err(err) => {
+                        tracing::debug!(
+                            field = rust_name,
+                            expected_type = %type_ir.diagnostic_repr(),
+                            "field coercion failed"
+                        );
                         errors.push(ParseError::CoercionFailed {
                             field: rust_name.clone(),
                             expected_type: type_ir.diagnostic_repr().to_string(),
@@ -621,6 +627,12 @@ impl ChatAdapter {
                         });
                         let expression = constraint.expression.to_string();
                         if constraint.level == ConstraintLevel::Assert && !passed {
+                            tracing::warn!(
+                                field = rust_name,
+                                label = label,
+                                expression = %expression,
+                                "assert constraint failed"
+                            );
                             errors.push(ParseError::AssertFailed {
                                 field: rust_name.clone(),
                                 label: label.to_string(),
@@ -629,6 +641,14 @@ impl ChatAdapter {
                             });
                         }
                         if constraint.level == ConstraintLevel::Check {
+                            if !passed {
+                                tracing::debug!(
+                                    field = rust_name,
+                                    label = label,
+                                    expression = %expression,
+                                    "check constraint failed"
+                                );
+                            }
                             checks.push(ConstraintResult {
                                 label: label.to_string(),
                                 expression,
@@ -874,8 +894,10 @@ impl Adapter for ChatAdapter {
         {
             let cache_key = inputs.clone();
             if let Some(cached) = cache.lock().await.get(cache_key).await? {
+                tracing::debug!("cache hit for adapter call");
                 return Ok(cached);
             }
+            tracing::debug!("cache miss for adapter call");
         }
 
         let messages = self.format(signature, inputs.clone());
@@ -912,6 +934,7 @@ impl Adapter for ChatAdapter {
         if lm.cache
             && let Some(cache) = lm.cache_handler.as_ref()
         {
+            tracing::debug!("storing result in cache");
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let cache_clone = cache.clone();
             let inputs_clone = inputs.clone();

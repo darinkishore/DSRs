@@ -527,6 +527,22 @@ impl Optimizer for MIPROv2 {
     where
         M: Module + Optimizable + Evaluator,
     {
+        let span = tracing::info_span!(
+            "mipro.compile",
+            candidates = self.num_candidates,
+            trials = self.num_trials,
+            minibatch_size = self.minibatch_size,
+            trainset_size = trainset.len(),
+        );
+        let _enter = span.enter();
+
+        tracing::info!(
+            candidates = self.num_candidates,
+            trials = self.num_trials,
+            trainset_size = trainset.len(),
+            "starting MIPROv2 optimization"
+        );
+
         println!("\n=== MIPROv2 Optimization Started ===");
         println!("Configuration:");
         println!("  Candidates: {}", self.num_candidates);
@@ -599,6 +615,7 @@ impl Optimizer for MIPROv2 {
             println!("  Instruction: {}\n", best_candidate.instruction);
         }
 
+        tracing::info!("MIPROv2 optimization complete");
         println!("=== MIPROv2 Optimization Complete ===\n");
         Ok(())
     }

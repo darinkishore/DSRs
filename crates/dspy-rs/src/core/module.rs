@@ -26,6 +26,16 @@ pub trait Module: Send + Sync {
         display_progress: bool,
     ) -> Result<Vec<Prediction>> {
         let total = inputs.len();
+
+        let span = tracing::info_span!(
+            "batch",
+            total = total,
+            max_concurrency = max_concurrency,
+        );
+        let _enter = span.enter();
+
+        tracing::info!(total = total, max_concurrency = max_concurrency, "starting batch");
+
         let mut pb = if display_progress {
             Some(tqdm!(total = total, desc = "Processing"))
         } else {
@@ -55,8 +65,20 @@ pub trait Module: Send + Sync {
         // Collect predictions and handle errors
         let mut predictions = Vec::with_capacity(total);
         for (_, result) in indexed_results {
-            predictions.push(result?);
+            match result {
+                Ok(pred) => predictions.push(pred),
+                Err(err) => {
+                    tracing::warn!(error = %err, "batch item failed");
+                    return Err(err);
+                }
+            }
         }
+
+        tracing::info!(
+            total = total,
+            succeeded = predictions.len(),
+            "batch completed"
+        );
 
         Ok(predictions)
     }

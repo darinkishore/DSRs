@@ -51,11 +51,21 @@ impl<S: Signature> Predict<S> {
         S::Input: ToBamlValue,
         S::Output: ToBamlValue,
     {
+        let signature_name = std::any::type_name::<S>();
         let lm = {
             let guard = GLOBAL_SETTINGS.read().unwrap();
             let settings = guard.as_ref().unwrap();
             Arc::clone(&settings.lm)
         };
+
+        let span = tracing::info_span!(
+            "predict",
+            signature = signature_name,
+            model = %lm.model,
+            demos = self.demos.len(),
+            tools = self.tools.len(),
+        );
+        let _enter = span.enter();
 
         let chat_adapter = ChatAdapter;
         let system = chat_adapter
@@ -78,33 +88,69 @@ impl<S: Signature> Predict<S> {
         }
         chat.push("user", &user);
 
+        tracing::debug!(
+            signature = signature_name,
+            message_count = chat.messages.len(),
+            "sending prompt to LM"
+        );
+
         let response = lm
             .call(chat, self.tools.clone())
             .await
-            .map_err(|err| PredictError::Lm {
-                source: LmError::Provider {
-                    provider: lm.model.clone(),
-                    message: err.to_string(),
-                    source: None,
-                },
+            .map_err(|err| {
+                tracing::warn!(
+                    signature = signature_name,
+                    error = %err,
+                    "LM call failed"
+                );
+                PredictError::Lm {
+                    source: LmError::Provider {
+                        provider: lm.model.clone(),
+                        message: err.to_string(),
+                        source: None,
+                    },
+                }
             })?;
 
         let raw_response = response.output.content().to_string();
         let lm_usage = response.usage.clone();
+
+        tracing::debug!(
+            signature = signature_name,
+            prompt_tokens = lm_usage.prompt_tokens,
+            completion_tokens = lm_usage.completion_tokens,
+            total_tokens = lm_usage.total_tokens,
+            "received LM response"
+        );
+
         let (typed_output, field_metas) = chat_adapter
             .parse_response_typed::<S>(&response.output)
-            .map_err(|err| PredictError::Parse {
-                source: err,
-                raw_response: raw_response.clone(),
-                lm_usage: lm_usage.clone(),
+            .map_err(|err| {
+                tracing::warn!(
+                    signature = signature_name,
+                    error = %err,
+                    "response parsing failed"
+                );
+                PredictError::Parse {
+                    source: err,
+                    raw_response: raw_response.clone(),
+                    lm_usage: lm_usage.clone(),
+                }
             })?;
+
+        tracing::info!(
+            signature = signature_name,
+            prompt_tokens = lm_usage.prompt_tokens,
+            completion_tokens = lm_usage.completion_tokens,
+            "prediction succeeded"
+        );
 
         let output = S::from_parts(input, typed_output);
 
         let node_id = if crate::trace::is_tracing() {
             crate::trace::record_node(
                 crate::trace::NodeType::Predict {
-                    signature_name: std::any::type_name::<S>().to_string(),
+                    signature_name: signature_name.to_string(),
                 },
                 vec![],
                 None,
@@ -455,6 +501,9 @@ impl LegacyPredict {
 
 impl super::Predictor for LegacyPredict {
     async fn forward(&self, inputs: Example) -> anyhow::Result<Prediction> {
+        let span = tracing::info_span!("legacy_predict");
+        let _enter = span.enter();
+
         let trace_node_id = if crate::trace::is_tracing() {
             let input_id = if let Some(id) = inputs.node_id {
                 id
@@ -483,9 +532,22 @@ impl super::Predictor for LegacyPredict {
             let settings = guard.as_ref().unwrap();
             (settings.adapter.clone(), Arc::clone(&settings.lm))
         }; // guard is dropped here
+
+        tracing::debug!(model = %lm.model, "calling LM via legacy predict");
+
         let mut prediction = adapter
             .call(lm, self.signature.as_ref(), inputs, self.tools.clone())
-            .await?;
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "legacy predict LM call failed");
+                err
+            })?;
+
+        tracing::info!(
+            prompt_tokens = prediction.lm_usage.prompt_tokens,
+            completion_tokens = prediction.lm_usage.completion_tokens,
+            "legacy prediction succeeded"
+        );
 
         if let Some(id) = trace_node_id {
             prediction.node_id = Some(id);
@@ -500,6 +562,12 @@ impl super::Predictor for LegacyPredict {
         inputs: Example,
         lm: Arc<LM>,
     ) -> anyhow::Result<Prediction> {
+        let span = tracing::info_span!(
+            "legacy_predict",
+            model = %lm.model,
+        );
+        let _enter = span.enter();
+
         let trace_node_id = if crate::trace::is_tracing() {
             let input_id = if let Some(id) = inputs.node_id {
                 id
@@ -523,9 +591,21 @@ impl super::Predictor for LegacyPredict {
             None
         };
 
+        tracing::debug!(model = %lm.model, "calling LM via legacy predict with config");
+
         let mut prediction = ChatAdapter
             .call(lm, self.signature.as_ref(), inputs, self.tools.clone())
-            .await?;
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "legacy predict LM call failed");
+                err
+            })?;
+
+        tracing::info!(
+            prompt_tokens = prediction.lm_usage.prompt_tokens,
+            completion_tokens = prediction.lm_usage.completion_tokens,
+            "legacy prediction succeeded"
+        );
 
         if let Some(id) = trace_node_id {
             prediction.node_id = Some(id);

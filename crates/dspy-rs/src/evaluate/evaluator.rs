@@ -10,6 +10,11 @@ pub trait Evaluator: Module {
     async fn metric(&self, example: &Example, prediction: &Prediction) -> f32;
 
     async fn evaluate(&self, examples: Vec<Example>) -> f32 {
+        let total = examples.len();
+
+        let span = tracing::info_span!("evaluate", examples = total);
+        let _enter = span.enter();
+
         let predictions = self
             .batch(
                 examples.clone(),
@@ -18,8 +23,6 @@ pub trait Evaluator: Module {
             )
             .await
             .unwrap();
-
-        let total = examples.len();
 
         // Pair examples with predictions and evaluate with controlled concurrency
         let metrics: Vec<f32> = stream::iter(examples.iter().zip(predictions.iter()).enumerate())
@@ -31,6 +34,8 @@ pub trait Evaluator: Module {
             .collect()
             .await;
 
-        metrics.iter().sum::<f32>() / total as f32
+        let score = metrics.iter().sum::<f32>() / total as f32;
+        tracing::info!(score = score, examples = total, "evaluation complete");
+        score
     }
 }

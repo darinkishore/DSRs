@@ -392,6 +392,21 @@ impl GEPA {
     where
         M: Module + Optimizable + FeedbackEvaluator,
     {
+        let span = tracing::info_span!(
+            "gepa.compile",
+            iterations = self.num_iterations,
+            minibatch_size = self.minibatch_size,
+            trainset_size = trainset.len(),
+        );
+        let _enter = span.enter();
+
+        tracing::info!(
+            iterations = self.num_iterations,
+            minibatch_size = self.minibatch_size,
+            trainset_size = trainset.len(),
+            "starting GEPA optimization"
+        );
+
         println!("GEPA: Starting reflective prompt optimization");
         println!("  Iterations: {}", self.num_iterations);
         println!("  Minibatch size: {}", self.minibatch_size);
@@ -412,6 +427,7 @@ impl GEPA {
 
         // Main evolutionary loop
         for generation in 0..self.num_iterations {
+            tracing::info!(generation = generation + 1, max = self.num_iterations, "starting generation");
             println!("\nGeneration {}/{}", generation + 1, self.num_iterations);
 
             // Check budget constraints
@@ -475,13 +491,16 @@ impl GEPA {
             total_rollouts += child_scores.len();
 
             let child_avg = child_scores.iter().sum::<f32>() / child_scores.len() as f32;
+            tracing::debug!(generation = generation + 1, child_avg = child_avg, "evaluated child candidate");
             println!("  Child avg score: {:.3}", child_avg);
 
             // Add to frontier
             let added = frontier.add_candidate(child.clone(), &child_scores);
             if added {
+                tracing::info!(generation = generation + 1, "candidate added to Pareto frontier");
                 println!("  Added to Pareto frontier");
             } else {
+                tracing::debug!(generation = generation + 1, "candidate dominated, not added");
                 println!("  Dominated, not added");
             }
 
@@ -505,6 +524,13 @@ impl GEPA {
             .context("No candidates on frontier")?
             .clone();
 
+        tracing::info!(
+            best_avg_score = best_candidate.average_score(),
+            total_rollouts = total_rollouts,
+            total_lm_calls = total_lm_calls,
+            frontier_size = frontier.len(),
+            "GEPA optimization complete"
+        );
         println!("\nGEPA optimization complete");
         println!(
             "  Best average score: {:.3}",
