@@ -1,5 +1,5 @@
 /*
-Script to inspect LM history after a typed predictor call.
+Script to inspect prediction history from the persistent database.
 
 Run with:
 ```
@@ -8,7 +8,9 @@ cargo run --example 07-inspect-history
 */
 
 use anyhow::Result;
-use dspy_rs::{ChatAdapter, LM, Predict, Signature, configure, get_lm, init_tracing};
+use dspy_rs::{
+    ChatAdapter, LM, Predict, PredictionDb, Signature, configure, init_tracing, session_id,
+};
 
 #[derive(Signature, Clone, Debug)]
 struct QA {
@@ -38,8 +40,34 @@ async fn main() -> Result<()> {
         .into_inner();
     println!("prediction: {:?}", output.answer);
 
-    let history = get_lm().inspect_history(1).await;
-    println!("history: {history:?}");
+    // Query the prediction database for recent history
+    if let Some(db) = PredictionDb::global() {
+        let recent = db.query_recent(5).unwrap_or_default();
+        println!("\n--- Recent predictions ({}) ---", recent.len());
+        for rec in &recent {
+            println!(
+                "  [{}] {} | {} | {} tokens | {}ms",
+                rec.status, rec.signature_name, rec.model_name, rec.total_tokens, rec.duration_ms,
+            );
+        }
+
+        // Query just this session
+        let session = db.query_by_session(session_id()).unwrap_or_default();
+        println!(
+            "\n--- This session ({}) ---\n  {} prediction(s)",
+            session_id(),
+            session.len()
+        );
+
+        // Token usage summary
+        let usage = db.token_usage_by_model().unwrap_or_default();
+        println!("\n--- Token usage by model ---");
+        for (model, prompt, completion, total) in &usage {
+            println!(
+                "  {model}: {total} total ({prompt} prompt + {completion} completion)"
+            );
+        }
+    }
 
     Ok(())
 }

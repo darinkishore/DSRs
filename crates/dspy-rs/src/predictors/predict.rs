@@ -179,6 +179,7 @@ impl<S: Signature> Predict<S> {
     /// 4. Call the LM (with any tools attached)
     /// 5. Parse the response into `S::Output` via the `[[ ## field ## ]]` protocol
     /// 6. Record a trace node if inside a [`trace()`](crate::trace::trace) scope
+    /// 7. Log the full prediction record to the [`PredictionDb`]
     ///
     /// # Errors
     ///
@@ -189,6 +190,8 @@ impl<S: Signature> Predict<S> {
         S::Input: BamlType,
         S::Output: BamlType,
     {
+        let started = std::time::Instant::now();
+
         let lm = {
             let guard = GLOBAL_SETTINGS.read().unwrap();
             let settings = guard.as_ref().unwrap();
@@ -211,6 +214,12 @@ impl<S: Signature> Predict<S> {
             }
         };
 
+        // Serialize input for logging (before we move anything)
+        let input_json = serde_json::to_value(input.to_baml_value())
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or_default();
+
         let user = chat_adapter.format_user_message_typed::<S>(&input);
         trace!(
             system_len = system.len(),
@@ -229,9 +238,31 @@ impl<S: Signature> Predict<S> {
         chat.push("user", &user);
         trace!(message_count = chat.len(), "chat constructed");
 
+        let chat_json = chat.to_json().to_string();
+
         let response = match lm.call(chat, self.tools.clone()).await {
             Ok(response) => response,
             Err(err) => {
+                // Log LM error
+                log_prediction_record(
+                    &lm,
+                    self.instruction_override.as_deref(),
+                    &self.demos,
+                    &chat_json,
+                    &input_json,
+                    "",     // no raw response
+                    None,   // no output
+                    false,
+                    "lm_error",
+                    Some(&err.to_string()),
+                    &LmUsage::default(),
+                    started.elapsed().as_millis() as u64,
+                    None, // no field_metas
+                    &[],  // no tool_calls
+                    &[],  // no tool_executions
+                    None, // no node_id
+                );
+
                 return Err(PredictError::Lm {
                     source: LmError::Provider {
                         provider: lm.model.clone(),
@@ -275,6 +306,27 @@ impl<S: Signature> Predict<S> {
                         raw_response_len = raw_response.len(),
                         "typed parse failed"
                     );
+
+                    // Log parse error
+                    log_prediction_record(
+                        &lm,
+                        self.instruction_override.as_deref(),
+                        &self.demos,
+                        &chat_json,
+                        &input_json,
+                        &raw_response,
+                        None,
+                        false,
+                        "parse_error",
+                        Some(&err.to_string()),
+                        &lm_usage,
+                        started.elapsed().as_millis() as u64,
+                        None,
+                        &response.tool_calls,
+                        &response.tool_executions,
+                        node_id,
+                    );
+
                     return Err(PredictError::Parse {
                         source: err,
                         raw_response,
@@ -313,6 +365,31 @@ impl<S: Signature> Predict<S> {
             }
         }
 
+        // Serialize output for logging
+        let output_json = serde_json::to_value(typed_output.to_baml_value())
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok());
+
+        // Log success
+        log_prediction_record(
+            &lm,
+            self.instruction_override.as_deref(),
+            &self.demos,
+            &chat_json,
+            &input_json,
+            &raw_response,
+            output_json.as_deref(),
+            true,
+            "success",
+            None,
+            &lm_usage,
+            started.elapsed().as_millis() as u64,
+            Some(&field_metas),
+            &response.tool_calls,
+            &response.tool_executions,
+            node_id,
+        );
+
         let metadata = CallMetadata::new(
             raw_response,
             lm_usage,
@@ -324,6 +401,151 @@ impl<S: Signature> Predict<S> {
 
         Ok(Predicted::new(typed_output, metadata))
     }
+}
+
+/// Fire-and-forget logging to the prediction database.
+///
+/// Serializes all available data into a `PredictionRecord` and writes it.
+/// Errors are silently ignored — logging must never break predictions.
+#[allow(clippy::too_many_arguments)]
+fn log_prediction_record<S: Signature>(
+    lm: &crate::core::lm::LM,
+    instruction_override: Option<&str>,
+    demos: &[Example<S>],
+    chat_json: &str,
+    input_json: &str,
+    raw_response: &str,
+    output_json: Option<&str>,
+    parse_success: bool,
+    status: &str,
+    error_message: Option<&str>,
+    lm_usage: &LmUsage,
+    duration_ms: u64,
+    field_metas: Option<&indexmap::IndexMap<String, crate::FieldMeta>>,
+    tool_calls: &[rig::message::ToolCall],
+    tool_executions: &[String],
+    node_id: Option<usize>,
+) where
+    S::Input: BamlType,
+    S::Output: BamlType,
+{
+    let db = match crate::PredictionDb::global() {
+        Some(db) => db,
+        None => return,
+    };
+
+    // Serialize demos
+    let demos_json = if demos.is_empty() {
+        None
+    } else {
+        let raw_demos: Vec<_> = demos
+            .iter()
+            .filter_map(|d| raw_example_from_typed::<S>(d).ok())
+            .map(|ex| ex.data)
+            .collect();
+        serde_json::to_string(&raw_demos).ok()
+    };
+
+    // Serialize field metas (simplified: raw_text + flags count + checks)
+    let field_meta_json = field_metas.and_then(|metas| {
+        let simplified: serde_json::Map<String, serde_json::Value> = metas
+            .iter()
+            .map(|(name, meta)| {
+                let obj = serde_json::json!({
+                    "raw_text": meta.raw_text,
+                    "flags": meta.flags.len(),
+                    "checks": meta.checks.iter().map(|c| {
+                        serde_json::json!({
+                            "label": c.label,
+                            "expression": c.expression,
+                            "passed": c.passed,
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                (name.clone(), obj)
+            })
+            .collect();
+        serde_json::to_string(&simplified).ok()
+    });
+
+    // Serialize tool calls
+    let tool_calls_json = if tool_calls.is_empty() {
+        None
+    } else {
+        serde_json::to_string(tool_calls).ok()
+    };
+
+    let tool_executions_json = if tool_executions.is_empty() {
+        None
+    } else {
+        serde_json::to_string(tool_executions).ok()
+    };
+
+    let record = crate::PredictionRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at: chrono_now_iso8601(),
+        signature_name: std::any::type_name::<S>().to_string(),
+        model_name: lm.model.clone(),
+        temperature: lm.temperature as f64,
+        max_tokens: lm.max_tokens,
+        instruction_override: instruction_override.map(|s| s.to_string()),
+        demo_count: demos.len() as u32,
+        demos_json,
+        chat_json: chat_json.to_string(),
+        input_json: input_json.to_string(),
+        raw_response: raw_response.to_string(),
+        output_json: output_json.map(|s| s.to_string()),
+        parse_success,
+        status: status.to_string(),
+        error_message: error_message.map(|s| s.to_string()),
+        prompt_tokens: lm_usage.prompt_tokens,
+        completion_tokens: lm_usage.completion_tokens,
+        total_tokens: lm_usage.total_tokens,
+        duration_ms,
+        field_meta_json,
+        tool_calls_json,
+        tool_executions_json,
+        trace_id: None, // TODO: capture trace_id when trace context provides one
+        node_id,
+        session_id: crate::session_id().to_string(),
+        tags: None,
+    };
+
+    if let Err(err) = db.log(&record) {
+        debug!(error = %err, "failed to log prediction to database");
+    }
+}
+
+/// Returns the current time as an ISO 8601 string (UTC, second precision).
+fn chrono_now_iso8601() -> String {
+    // Avoid adding the chrono crate — manual formatting from SystemTime.
+    use std::time::SystemTime;
+    let duration = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    // Simple UTC timestamp: seconds since epoch → formatted string
+    // We use a minimal formatter to avoid external deps.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Convert days since epoch to year-month-day
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 impl<S: Signature> Default for Predict<S> {
